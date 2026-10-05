@@ -1,6 +1,9 @@
 /**
- * 路由表：/arrays、/stations/:id/instruments、/calibrations、/replacements、/geometry
- * 路径与提示词逐字一致；页面按路由懒加载，构建时自动分包。
+ * 路由表：
+ * - 计量站侧：/regulations（检定规程管理）、/reconciliation（规程对账）
+ * - 台网中心侧：/arrays、/stations/:id/instruments、/calibrations、/replacements
+ * - 公共：/geometry
+ * 页面按路由懒加载，构建时自动分包。
  */
 import { Suspense, lazy, type ReactNode } from 'react';
 import { Navigate, type RouteObject } from 'react-router-dom';
@@ -12,6 +15,8 @@ const StationInstruments = lazy(() => import('@/pages/StationInstruments'));
 const CalibrationBoard = lazy(() => import('@/pages/CalibrationBoard'));
 const ReplaceBoard = lazy(() => import('@/pages/ReplaceBoard'));
 const GeometryView = lazy(() => import('@/pages/GeometryView'));
+const RegulationBoard = lazy(() => import('@/pages/RegulationBoard'));
+const ReconciliationBoard = lazy(() => import('@/pages/ReconciliationBoard'));
 
 /** 懒加载页面占位 */
 function RouteFallback() {
@@ -30,6 +35,8 @@ function withSuspense(node: ReactNode): ReactNode {
 }
 
 export const ROUTES = {
+  regulations: '/regulations',
+  reconciliation: '/reconciliation',
   arrays: '/arrays',
   stations: (arrayId: string): string => `/stations/${arrayId}/instruments`,
   calibrations: '/calibrations',
@@ -43,6 +50,8 @@ export const appRoutes: RouteObject[] = [
     element: <App />,
     children: [
       { index: true, element: <Navigate to={ROUTES.arrays} replace /> },
+      { path: 'regulations', element: withSuspense(<RegulationBoard />) },
+      { path: 'reconciliation', element: withSuspense(<ReconciliationBoard />) },
       { path: 'arrays', element: withSuspense(<ArrayList />) },
       { path: 'stations/:id/instruments', element: withSuspense(<StationInstruments />) },
       { path: 'calibrations', element: withSuspense(<CalibrationBoard />) },

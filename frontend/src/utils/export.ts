@@ -1,6 +1,7 @@
 /**
  * 备份导入导出：整库 JSON 快照的组装、校验、下载与导入；
  * 以及按台阵汇总的几何与标定结论生成。
+ * 快照含计量站规程表与台网中心标定表，两边数据一起备份。
  */
 import {
   db,
@@ -15,14 +16,15 @@ import type { ResponseVerdict } from '@/types/calibration';
 import { apertureKm, centroid, haversineKm, round, stationDistances } from '@/utils/geo';
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['arrays', 'stations', 'instruments', 'calibrations', 'replaces'] as const;
+export const BACKUP_KEYS = ['regulations', 'arrays', 'stations', 'instruments', 'calibrations', 'replaces'] as const;
 export type BackupKey = (typeof BACKUP_KEYS)[number];
 
 export type CountMap = Record<BackupKey, number>;
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [regulations, arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+    db.regulations.toArray(),
     db.arrays.toArray(),
     db.stations.toArray(),
     db.instruments.toArray(),
@@ -33,6 +35,7 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     app: 'gbseisarray',
     dbVersion: DB_VERSION,
     exportedAt: new Date().toISOString(),
+    regulations,
     arrays,
     stations,
     instruments,
@@ -63,6 +66,7 @@ export function validateBackup(input: unknown): {
     app: 'gbseisarray',
     dbVersion: typeof obj.dbVersion === 'number' ? obj.dbVersion : DB_VERSION,
     exportedAt: typeof obj.exportedAt === 'string' ? obj.exportedAt : new Date().toISOString(),
+    regulations: obj.regulations ?? [],
     arrays: obj.arrays ?? [],
     stations: obj.stations ?? [],
     instruments: obj.instruments ?? [],
@@ -75,6 +79,7 @@ export function validateBackup(input: unknown): {
 /** 统计快照各表行数 */
 export function countPayload(payload: BackupPayload): CountMap {
   return {
+    regulations: payload.regulations.length,
     arrays: payload.arrays.length,
     stations: payload.stations.length,
     instruments: payload.instruments.length,
@@ -117,8 +122,9 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables();
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.regulations, db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
     async () => {
+      await db.regulations.bulkPut(payload.regulations);
       await db.arrays.bulkPut(payload.arrays);
       await db.stations.bulkPut(payload.stations);
       await db.instruments.bulkPut(payload.instruments);
@@ -135,6 +141,8 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const stationMap = new Map<string, string>();
   const instrumentMap = new Map<string, string>();
 
+  // 规程是计量站维护的共享台账，追加导入不重新分配 id，保持标定引用可对账
+  const regulations = payload.regulations;
   const arrays = payload.arrays.map((row) => {
     const id = createId('arr');
     arrayMap.set(row.id, id);
@@ -160,7 +168,7 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('rpl'),
     instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
   }));
-  return { ...payload, arrays, stations, instruments, calibrations, replaces };
+  return { ...payload, regulations, arrays, stations, instruments, calibrations, replaces };
 }
 
 /** 按台阵汇总的几何与标定结论 */

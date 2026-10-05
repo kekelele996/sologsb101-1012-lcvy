@@ -1,3 +1,13 @@
+/**
+ * 标定记录（台网中心维护）。
+ *
+ * 响应结论不再由写死的类型区间判定，而是：
+ * 1. 按「趟次号（tripNo）」把同一次出车的多台仪器归为一组，同趟绑定同一版规程；
+ * 2. 按标定当天生效的检定规程版本取该仪器类型的区间与自噪上限判定；
+ * 3. 出结论时固化判据快照（VerdictBasis），规程换版或作废后已出结论照旧保留。
+ */
+import type { CalibrationBindStatus, VerdictBasis } from '@/types/regulation';
+
 /** 响应结论 */
 export type ResponseVerdict = '合格' | '不合格' | '待判定';
 
@@ -10,12 +20,27 @@ export interface Calibration {
   instrumentId: string;
   /** 标定日期 */
   date: string;
+  /**
+   * 趟次号：同一次出车标定的多台仪器共用一个趟次号，
+   * 全组绑定标定当天生效的同一版规程（如 PC20240930-HX01）。
+   */
+  tripNo: string;
   /** 灵敏度（V·s/m） */
   sensitivity: number;
   /** 自噪（m/s² 或 counts，按台网口径记录） */
   selfNoise: number;
   /** 脉冲响应结论 */
   responseVerdict: ResponseVerdict;
+  /** 绑定的规程 id（对不上账时可为空并只读保留） */
+  regulationId: string | null;
+  /** 冗余记录规程号，用于两边对账 */
+  regulationCode: string;
+  /** 绑定状态：已绑定 / 待重判 / 对账不符只读 */
+  bindStatus: CalibrationBindStatus;
+  /** 已出结论的判据快照；待判定 / 待重判时为 null */
+  verdictBasis: VerdictBasis | null;
+  /** 最近一次重判失败原因（仅挂在本方标定上，不动规程） */
+  judgeError: string;
   /** 标定人 */
   operator: string;
   /** 标定机构 */
@@ -24,30 +49,6 @@ export interface Calibration {
   remark: string;
   createdAt: number;
   updatedAt: number;
-}
-
-/**
- * 自动初判：灵敏度落在合理区间且自噪不高于阈值判合格。
- * 阈值按台网常规口径给出，最终以标定报告为准。
- */
-export const SENSITIVITY_RANGE: Record<string, { min: number; max: number }> = {
-  宽频带: { min: 800, max: 3000 },
-  短周期: { min: 100, max: 800 },
-  强震: { min: 0.1, max: 5 }
-};
-
-export const SELF_NOISE_LIMIT = 3.5;
-
-export function judgeCalibration(
-  type: string,
-  sensitivity: number,
-  selfNoise: number
-): ResponseVerdict {
-  if (!Number.isFinite(sensitivity) || !Number.isFinite(selfNoise)) return '待判定';
-  const range = SENSITIVITY_RANGE[type] ?? { min: 0, max: Number.MAX_SAFE_INTEGER };
-  if (sensitivity < range.min || sensitivity > range.max) return '不合格';
-  if (selfNoise > SELF_NOISE_LIMIT) return '不合格';
-  return '合格';
 }
 
 /** 灵敏度变化量（相对上一次标定），返回绝对值与百分比 */

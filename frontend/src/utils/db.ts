@@ -2,19 +2,23 @@
  * IndexedDB 持久化层（Dexie 封装）
  * - 库名 gbseisarray，含数据结构版本号与升级迁移逻辑
  * - 升级时按 version().stores() 补齐索引
- * - 首次打开自动播种互相引用的演示数据（台阵 → 台站 → 仪器 → 标定 / 更换）
+ * - 首次打开自动播种互相引用的演示数据（规程 → 台阵 → 台站 → 仪器 → 标定 / 更换）
  * - 纯前端应用：不依赖任何后端服务或数据库服务
  */
 import Dexie, { liveQuery, type Table } from 'dexie';
 import type { SeisArray } from '@/types/array';
 import type { SeisStation } from '@/types/station';
-import type { Instrument } from '@/types/instrument';
-import { judgeCalibration } from '@/types/calibration';
-import type { Calibration } from '@/types/calibration';
+import type { Instrument, InstrumentType } from '@/types/instrument';
+import type {
+  Calibration,
+} from '@/types/calibration';
 import type { Replace } from '@/types/replace';
+import type { VerificationRegulation, VerdictBasis } from '@/types/regulation';
+import { judgeAgainst } from '@/utils/calibration';
+import { backfillLegacyBinding } from '@/utils/calibration';
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbseisarray';
@@ -31,6 +35,7 @@ export interface BackupPayload {
   app: 'gbseisarray';
   dbVersion: number;
   exportedAt: string;
+  regulations: VerificationRegulation[];
   arrays: SeisArray[];
   stations: SeisStation[];
   instruments: Instrument[];
@@ -39,6 +44,7 @@ export interface BackupPayload {
 }
 
 export class SeisArrayDatabase extends Dexie {
+  regulations!: Table<VerificationRegulation, string>;
   arrays!: Table<SeisArray, string>;
   stations!: Table<SeisStation, string>;
   instruments!: Table<Instrument, string>;
@@ -58,16 +64,30 @@ export class SeisArrayDatabase extends Dexie {
     });
 
     // v2：补齐筛选与统计需要的索引（孔径/布设日期、经纬度/基岩、类型/序列号、灵敏度/结论、原因）
+    this.version(2).stores({
+      arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
+      stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
+      instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
+      calibrations: 'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, updatedAt',
+      replaces: 'id, instrumentId, state, date, newSerialNo, updatedAt',
+    });
+
+    // v3：检定规程与标定分家。
+    // - 新增 regulations 表（计量站维护：规程号/版次/生效起止/类型判据）；
+    // - 标定增加趟次号、规程引用、绑定状态、判据快照索引；
+    // - 旧数据没记规程号，按标定日期回填当时生效版本；对不上的置只读保留。
     this.version(DB_VERSION)
       .stores({
+        regulations: 'id, regulationCode, edition, status, effectiveFrom, effectiveTo',
         arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
         stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
         instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
-        calibrations: 'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, updatedAt',
+        calibrations:
+          'id, instrumentId, date, tripNo, sensitivity, selfNoise, responseVerdict, regulationId, regulationCode, bindStatus, updatedAt',
         replaces: 'id, instrumentId, state, date, newSerialNo, updatedAt',
       })
       .upgrade(async (tx) => {
-        // 迁移：历史数据补齐时间戳与必填字段，避免列表排序与筛选拿到 undefined
+        // v1 旧字段兜底（只补缺失键，不覆盖 v2 已有值）
         const defaults: Array<[string, () => Record<string, unknown>]> = [
           ['arrays', () => ({ apertureKm: 0, stationCount: 0, department: '' })],
           ['stations', () => ({ lat: 0, lng: 0, elevM: 0, bedrock: '花岗岩', siteNote: '' })],
@@ -83,9 +103,83 @@ export class SeisArrayDatabase extends Dexie {
               const now = Date.now();
               if (typeof row.createdAt !== 'number') row.createdAt = now;
               if (typeof row.updatedAt !== 'number') row.updatedAt = row.createdAt;
-              Object.assign(row, factory());
+              const fallback = factory();
+              Object.keys(fallback).forEach((key) => {
+                if (row[key] === undefined) row[key] = fallback[key];
+              });
             });
         }
+
+        // 灌入规程基线版本（旧版 + 新版）
+        const seedRegulations = buildSeedRegulations(Date.now());
+        await tx.table('regulations').bulkPut(seedRegulations);
+        const regulationsById = new Map(seedRegulations.map((item) => [item.id, item] as const));
+        const instrumentType = new Map<string, string>();
+        await tx
+          .table('instruments')
+          .toCollection()
+          .each((instrument: Instrument) => {
+            instrumentType.set(instrument.id, instrument.type);
+          });
+
+        // 旧标定回填：按日期定位当时版本，并补趟次号（同日同机构归为同趟）
+        const tripKeys = new Map<string, string>();
+        await tx
+          .table('calibrations')
+          .toCollection()
+          .modify((row: Calibration) => {
+            const now = Date.now();
+            const date = typeof row.date === 'string' ? row.date : '1970-01-01';
+            const agencyKey = String((row as { agency?: string }).agency ?? '');
+            const tripGroupKey = `${date}|${agencyKey}`;
+            let tripNo = tripKeys.get(tripGroupKey);
+            if (!tripNo) {
+              const suffix = agencyKey.slice(0, 2) || 'OLD';
+              tripNo = `PC${date.replace(/-/g, '')}-${suffix}`;
+              tripKeys.set(tripGroupKey, tripNo);
+            }
+            row.tripNo = tripNo;
+
+            const backfill = backfillLegacyBinding(seedRegulations, { date });
+            row.regulationId = backfill.regulationId;
+            row.regulationCode = backfill.regulationCode;
+            row.bindStatus = backfill.bindStatus;
+            row.judgeError = backfill.bindStatus === 'readonlyMismatch' ? '升级回填未匹配到当日生效规程，只读保留' : '';
+            row.verdictBasis = null;
+            // 已出结论的照旧保留，并补写依据哪版（固化当时的判据快照）
+            if (backfill.bindStatus === 'bound' && row.responseVerdict !== '待判定' && backfill.regulationId) {
+              const regulation = regulationsById.get(backfill.regulationId) ?? null;
+              const type = instrumentType.get(row.instrumentId) ?? '宽频带';
+              const criterion = regulation?.criteria[type as InstrumentType] ?? null;
+              if (regulation && criterion) {
+                const basis: VerdictBasis = {
+                  regulationId: regulation.id,
+                  regulationCode: regulation.regulationCode,
+                  edition: regulation.edition,
+                  mode: 'on-date',
+                  criterion: { ...criterion },
+                  judgedAt: typeof row.updatedAt === 'number' ? row.updatedAt : now,
+                };
+                row.verdictBasis = basis;
+              } else {
+                // 旧版未覆盖该类型：结论保留但无快照，列入只读
+                row.bindStatus = 'readonlyMismatch';
+                row.regulationId = null;
+                row.regulationCode = backfill.regulationCode;
+                row.judgeError = '当时生效规程未覆盖该仪器类型，只读保留';
+              }
+            }
+            // 引用到的旧版已作废且未出结论的，按新版挂起重判（基线切换日 2024-07-01 之后仍待判定者）
+            if (
+              backfill.bindStatus === 'bound' &&
+              row.responseVerdict === '待判定' &&
+              backfill.regulationId === 'reg_seis_2015'
+            ) {
+              row.bindStatus = 'pendingRejudge';
+              row.judgeError = '所依据 2015 版已换版作废，等待按 2024 版重判';
+            }
+            row.updatedAt = typeof row.updatedAt === 'number' ? row.updatedAt : now;
+          });
       });
   }
 }
@@ -114,12 +208,67 @@ export function watchTable<T>(
   };
 }
 
+/* ------------------------------ 规程播种 ------------------------------ */
+
+/**
+ * 规程基线（计量站口径）：
+ * - JJG(地震)860《地震观测仪器检定规程》2015 版：2015-01-01 ~ 2024-06-30，已作废；
+ * - 同规程号 2024 版：2024-07-01 起生效，计量站换检定规程后各类型灵敏度与自噪上限均有调整。
+ * 规程号跨版稳定，年份体现在版次上。
+ */
+export function buildSeedRegulations(now: number): VerificationRegulation[] {
+  const oldCriteria = {
+    宽频带: { sensitivityMin: 800, sensitivityMax: 3000, selfNoiseLimit: 3.5 },
+    短周期: { sensitivityMin: 100, sensitivityMax: 800, selfNoiseLimit: 3.5 },
+    强震: { sensitivityMin: 0.1, sensitivityMax: 5, selfNoiseLimit: 3.5 },
+  } as VerificationRegulation['criteria'];
+  const newCriteria = {
+    宽频带: { sensitivityMin: 900, sensitivityMax: 2800, selfNoiseLimit: 3.0 },
+    短周期: { sensitivityMin: 120, sensitivityMax: 750, selfNoiseLimit: 3.0 },
+    强震: { sensitivityMin: 0.2, sensitivityMax: 4.5, selfNoiseLimit: 2.5 },
+  } as VerificationRegulation['criteria'];
+  return [
+    {
+      id: 'reg_seis_2015',
+      regulationCode: 'JJG(地震)860',
+      edition: '2015 版',
+      name: '地震观测仪器检定规程（宽频带 / 短周期 / 强震）',
+      issuer: '省地震局计量站',
+      effectiveFrom: '2015-01-01',
+      effectiveTo: '2024-06-30',
+      status: '已作废',
+      criteria: oldCriteria,
+      remark: '已被同规程号 2024 版替代；历史标定结论照旧保留。',
+      createdAt: now,
+      updatedAt: now,
+    },
+    {
+      id: 'reg_seis_2024',
+      regulationCode: 'JJG(地震)860',
+      edition: '2024 版',
+      name: '地震观测仪器检定规程（宽频带 / 短周期 / 强震）',
+      issuer: '省地震局计量站',
+      effectiveFrom: '2024-07-01',
+      effectiveTo: null,
+      status: '生效中',
+      criteria: newCriteria,
+      remark: '换检定规程后各类型灵敏度区间收窄、自噪上限下调。',
+      createdAt: now,
+      updatedAt: now,
+    },
+  ];
+}
+
 /* ------------------------------ 演示数据播种 ------------------------------ */
 
 interface SeedCalibration {
   id: string;
   instrumentId: string;
   date: string;
+  /** 同趟出车共用趟次号 */
+  tripNo: string;
+  /** 计量站规程号（标定当天须有生效版） */
+  regulationCode: string;
   sensitivity: number;
   selfNoise: number;
   operator: string;
@@ -161,16 +310,19 @@ interface SeedArray {
   stations: SeedStation[];
 }
 
-/**
- * 播种演示数据：2 个台阵 → 5 个台站 → 8 台仪器 → 14 条标定 + 3 条更换，
- * 覆盖「在用 / 待标定 / 已停用」与「合格 / 不合格」以及超期未标定样本。
- */
-export async function seedDemoData(): Promise<void> {
-  const now = Date.now();
-  const today = new Date(now).toISOString().slice(0, 10);
-  const daysAgo = (days: number): string => new Date(now - days * 86400000).toISOString().slice(0, 10);
+const REG_CODE_2015 = 'JJG(地震)860';
+const REG_CODE_2024 = 'JJG(地震)860';
 
-  const arrays: SeedArray[] = [
+/**
+ * 播种演示数据：2 个规程版本 → 2 个台阵 → 5 个台站 → 8 台仪器 → 16 条标定 + 3 条更换。
+ * 刻意包含：
+ * - 同趟出车多台共用趟次号（海西 HX01 两台 2024-09-30 同趟）；
+ * - 一次旧版下的不合格（自噪 4.8 > 3.5）；
+ * - 一条换版后挂起待重判（2024-07-01 后录入、待判定）；
+ * - 一条对不上账的旧数据（规程号查无、只读保留）。
+ */
+export function buildSeedArrays(): SeedArray[] {
+  return [
     {
       id: 'arr_ltx',
       name: '龙门峡流动台阵',
@@ -203,21 +355,25 @@ export async function seedDemoData(): Promise<void> {
                   id: 'cal_ltx01_bb_1',
                   instrumentId: 'ins_ltx01_bb',
                   date: '2023-04-20',
+                  tripNo: 'PC20230420-LTX',
+                  regulationCode: REG_CODE_2015,
                   sensitivity: 1502.4,
                   selfNoise: 1.82,
                   operator: '陈立群',
                   agency: '省地震局计量站',
-                  remark: '响应曲线平滑',
+                  remark: '响应曲线平滑（2015 版判定）',
                 },
                 {
                   id: 'cal_ltx01_bb_2',
                   instrumentId: 'ins_ltx01_bb',
                   date: '2024-04-12',
+                  tripNo: 'PC20240412-LTX',
+                  regulationCode: REG_CODE_2015,
                   sensitivity: 1468.9,
                   selfNoise: 1.95,
                   operator: '陈立群',
                   agency: '省地震局计量站',
-                  remark: '灵敏度略降 2.2%，仍在限内',
+                  remark: '灵敏度略降 2.2%，仍在限内（2015 版）',
                 },
               ],
             },
@@ -235,11 +391,13 @@ export async function seedDemoData(): Promise<void> {
                   id: 'cal_ltx01_st_1',
                   instrumentId: 'ins_ltx01_st',
                   date: '2022-05-06',
+                  tripNo: 'PC20220506-LTX',
+                  regulationCode: REG_CODE_2015,
                   sensitivity: 412.6,
                   selfNoise: 2.4,
                   operator: '周渝',
                   agency: '省地震局计量站',
-                  remark: '首次标定',
+                  remark: '首次标定（2015 版）',
                 },
               ],
             },
@@ -269,11 +427,13 @@ export async function seedDemoData(): Promise<void> {
                   id: 'cal_ltx02_bb_1',
                   instrumentId: 'ins_ltx02_bb',
                   date: '2024-03-18',
+                  tripNo: 'PC20240318-LTX02',
+                  regulationCode: REG_CODE_2015,
                   sensitivity: 1204.8,
                   selfNoise: 1.42,
                   operator: '林之遥',
                   agency: '省地震局计量站',
-                  remark: '响应一致性良好',
+                  remark: '响应一致性良好（2015 版）',
                 },
               ],
             },
@@ -291,11 +451,13 @@ export async function seedDemoData(): Promise<void> {
                   id: 'cal_ltx02_st_1',
                   instrumentId: 'ins_ltx02_st',
                   date: '2023-03-10',
+                  tripNo: 'PC20230310-LTX02',
+                  regulationCode: REG_CODE_2015,
                   sensitivity: 265.2,
                   selfNoise: 4.8,
                   operator: '周渝',
                   agency: '省地震局计量站',
-                  remark: '自噪超标，判定不合格',
+                  remark: '自噪超标，2015 版判定不合格（旧版结论保留）',
                 },
               ],
             },
@@ -325,11 +487,13 @@ export async function seedDemoData(): Promise<void> {
                   id: 'cal_ltx03_bb_1',
                   instrumentId: 'ins_ltx03_bb',
                   date: '2024-09-05',
+                  tripNo: 'PC20240905-LTX03',
+                  regulationCode: REG_CODE_2024,
                   sensitivity: 2251.3,
                   selfNoise: 2.05,
                   operator: '林之遥',
                   agency: '省地震局计量站',
-                  remark: '脉冲响应合格',
+                  remark: '脉冲响应合格（2024 版）',
                 },
               ],
             },
@@ -369,21 +533,26 @@ export async function seedDemoData(): Promise<void> {
                   id: 'cal_hx01_bb_1',
                   instrumentId: 'ins_hx01_bb',
                   date: '2023-09-28',
+                  tripNo: 'PC20230928-HX',
+                  regulationCode: REG_CODE_2015,
                   sensitivity: 1498.2,
                   selfNoise: 2.25,
                   operator: '陈立群',
                   agency: '国家测震台网计量中心',
-                  remark: '响应合格',
+                  remark: '响应合格（2015 版）',
                 },
+                // 2024-09-30 与同台强震仪同趟出车，共用趟次号、同落 2024 版
                 {
                   id: 'cal_hx01_bb_2',
                   instrumentId: 'ins_hx01_bb',
                   date: '2024-09-30',
+                  tripNo: 'PC20240930-HX01',
+                  regulationCode: REG_CODE_2024,
                   sensitivity: 1483.6,
                   selfNoise: 2.42,
                   operator: '陈立群',
                   agency: '国家测震台网计量中心',
-                  remark: '变化 0.97%，合格',
+                  remark: '变化 0.97%，2024 版合格',
                 },
               ],
             },
@@ -401,11 +570,13 @@ export async function seedDemoData(): Promise<void> {
                   id: 'cal_hx01_sm_1',
                   instrumentId: 'ins_hx01_sm',
                   date: '2024-09-30',
+                  tripNo: 'PC20240930-HX01',
+                  regulationCode: REG_CODE_2024,
                   sensitivity: 1.24,
                   selfNoise: 1.05,
                   operator: '周渝',
                   agency: '国家测震台网计量中心',
-                  remark: '强震通道合格',
+                  remark: '强震通道合格，与同台宽频带同趟（2024 版）',
                 },
               ],
             },
@@ -435,11 +606,13 @@ export async function seedDemoData(): Promise<void> {
                   id: 'cal_hx02_bb_1',
                   instrumentId: 'ins_hx02_bb',
                   date: '2023-06-11',
+                  tripNo: 'PC20230611-HX02',
+                  regulationCode: REG_CODE_2015,
                   sensitivity: 1388.4,
                   selfNoise: 3.9,
                   operator: '林之遥',
                   agency: '国家测震台网计量中心',
-                  remark: '自噪接近上限，判定不合格',
+                  remark: '自噪高于上限，2015 版判定不合格',
                 },
               ],
             },
@@ -448,6 +621,55 @@ export async function seedDemoData(): Promise<void> {
       ],
     },
   ];
+}
+
+/** 换版后挂起待重判的样例（引用已作废 2015 版、未出结论，可按 2024 版一键重判） */
+function buildPendingSeedCalibration(): SeedCalibration & { instrumentId: string } {
+  return {
+    id: 'cal_ltx03_bb_pending',
+    instrumentId: 'ins_ltx03_bb',
+    date: '2024-06-28',
+    tripNo: 'PC20240628-LTX03',
+    regulationCode: REG_CODE_2015,
+    sensitivity: 2780,
+    selfNoise: 3.2,
+    operator: '林之遥',
+    agency: '省地震局计量站',
+    remark: '换版前最后一趟录入，报告结论未出，挂起按 2024 版重判',
+  };
+}
+
+/** 对不上账的旧数据样例：规程号在规程库中查无，只读保留 */
+function buildMismatchSeedCalibration(): SeedCalibration & { instrumentId: string } {
+  return {
+    id: 'cal_hx02_bb_legacy_mismatch',
+    instrumentId: 'ins_hx02_bb',
+    date: '2014-05-09',
+    tripNo: 'PC20140509-HX02',
+    regulationCode: 'JJG(地震)860-2004',
+    sensitivity: 1320,
+    selfNoise: 3.1,
+    operator: '佚名',
+    agency: '国家测震台网计量中心',
+    remark: '早期纸质台账转录，规程版本在库中缺失，对不上账只读保留',
+  };
+}
+
+export async function seedDemoData(): Promise<void> {
+  const now = Date.now();
+  const today = new Date(now).toISOString().slice(0, 10);
+  const daysAgo = (days: number): string => new Date(now - days * 86400000).toISOString().slice(0, 10);
+
+  const regulations = buildSeedRegulations(now);
+  const regulationById = new Map(regulations.map((item) => [item.id, item] as const));
+  const regulationByCodeDate = (code: string, date: string): VerificationRegulation | null => {
+    const found = regulations
+      .filter((item) => item.regulationCode === code && item.effectiveFrom <= date && (item.effectiveTo === null || item.effectiveTo >= date))
+      .sort((a, b) => b.effectiveFrom.localeCompare(a.effectiveFrom))[0];
+    return found ?? null;
+  };
+
+  const arrays = buildSeedArrays();
 
   const replaces: Replace[] = [
     {
@@ -490,7 +712,7 @@ export async function seedDemoData(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.regulations, db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
     async () => {
       const stamp = (offset: number): { createdAt: number; updatedAt: number } => ({
         createdAt: now + offset,
@@ -501,6 +723,61 @@ export async function seedDemoData(): Promise<void> {
       const stationRows: SeisStation[] = [];
       const instrumentRows: Instrument[] = [];
       const calibrationRows: Calibration[] = [];
+
+      const appendCalibration = (
+        seed: SeedCalibration,
+        type: InstrumentType,
+        offset: number
+      ): void => {
+        const regulation = regulationByCodeDate(seed.regulationCode, seed.date);
+        const stampPair = stamp(offset);
+        if (!regulation) {
+          // 对不上账：只读保留，不出结论
+          calibrationRows.push({
+            id: seed.id,
+            instrumentId: seed.instrumentId,
+            date: seed.date,
+            tripNo: seed.tripNo,
+            sensitivity: seed.sensitivity,
+            selfNoise: seed.selfNoise,
+            responseVerdict: '待判定',
+            regulationId: null,
+            regulationCode: seed.regulationCode,
+            bindStatus: 'readonlyMismatch',
+            verdictBasis: null,
+            judgeError: `规程号 ${seed.regulationCode} 在 ${seed.date} 无生效版本，只读保留`,
+            operator: seed.operator,
+            agency: seed.agency,
+            remark: seed.remark,
+            ...stampPair,
+          });
+          return;
+        }
+        const outcome = judgeAgainst(
+          regulation,
+          { type, sensitivity: seed.sensitivity, selfNoise: seed.selfNoise },
+          'on-date'
+        );
+        const pending = outcome.verdict === '待判定' || !outcome.basis;
+        calibrationRows.push({
+          id: seed.id,
+          instrumentId: seed.instrumentId,
+          date: seed.date,
+          tripNo: seed.tripNo,
+          sensitivity: seed.sensitivity,
+          selfNoise: seed.selfNoise,
+          responseVerdict: outcome.verdict,
+          regulationId: regulation.id,
+          regulationCode: regulation.regulationCode,
+          bindStatus: pending ? 'pendingRejudge' : 'bound',
+          verdictBasis: outcome.basis,
+          judgeError: pending ? outcome.error || '未得出结论，待重判' : '',
+          operator: seed.operator,
+          agency: seed.agency,
+          remark: seed.remark,
+          ...stampPair,
+        });
+      };
 
       arrays.forEach((seed, arrayIndex) => {
         const { stations, ...arrayRest } = seed;
@@ -515,23 +792,62 @@ export async function seedDemoData(): Promise<void> {
               ...stamp(200 + arrayIndex * 200 + stationIndex * 50 + instrumentIndex),
             });
             calibrations.forEach((calibrationSeed, calibrationIndex) => {
-              const verdict = judgeCalibration(
+              appendCalibration(
+                calibrationSeed,
                 instrumentRest.type,
-                calibrationSeed.sensitivity,
-                calibrationSeed.selfNoise
+                400 + arrayIndex * 400 + stationIndex * 100 + instrumentIndex * 20 + calibrationIndex
               );
-              calibrationRows.push({
-                ...calibrationSeed,
-                responseVerdict: verdict,
-                ...stamp(
-                  400 + arrayIndex * 400 + stationIndex * 100 + instrumentIndex * 20 + calibrationIndex
-                ),
-              });
             });
           });
         });
       });
 
+      // 换版后挂起样例：绑旧版、未出结论
+      const pendingSeed = buildPendingSeedCalibration();
+      {
+        const pendingRegulation = regulationById.get('reg_seis_2015');
+        calibrationRows.push({
+          id: pendingSeed.id,
+          instrumentId: pendingSeed.instrumentId,
+          date: pendingSeed.date,
+          tripNo: pendingSeed.tripNo,
+          sensitivity: pendingSeed.sensitivity,
+          selfNoise: pendingSeed.selfNoise,
+          responseVerdict: '待判定',
+          regulationId: pendingRegulation?.id ?? null,
+          regulationCode: REG_CODE_2015,
+          bindStatus: 'pendingRejudge',
+          verdictBasis: null,
+          judgeError: '2015 版已换版作废，等待按 2024 版重判（灵敏度 2780 在新版将判不合格）',
+          operator: pendingSeed.operator,
+          agency: pendingSeed.agency,
+          remark: pendingSeed.remark,
+          ...stamp(900),
+        });
+      }
+
+      // 对不上账样例
+      const mismatchSeed = buildMismatchSeedCalibration();
+      calibrationRows.push({
+        id: mismatchSeed.id,
+        instrumentId: mismatchSeed.instrumentId,
+        date: mismatchSeed.date,
+        tripNo: mismatchSeed.tripNo,
+        sensitivity: mismatchSeed.sensitivity,
+        selfNoise: mismatchSeed.selfNoise,
+        responseVerdict: '待判定',
+        regulationId: null,
+        regulationCode: mismatchSeed.regulationCode,
+        bindStatus: 'readonlyMismatch',
+        verdictBasis: null,
+        judgeError: `规程号 ${mismatchSeed.regulationCode} 在库中缺失，对不上账只读保留`,
+        operator: mismatchSeed.operator,
+        agency: mismatchSeed.agency,
+        remark: mismatchSeed.remark,
+        ...stamp(901),
+      });
+
+      await db.regulations.bulkPut(regulations);
       await db.arrays.bulkPut(arrayRows);
       await db.stations.bulkPut(stationRows);
       await db.instruments.bulkPut(instrumentRows);
@@ -546,6 +862,11 @@ export async function initDatabase(): Promise<void> {
   await db.open();
   const count = await db.arrays.count();
   if (count === 0) {
+    // 新库：规程表也要确保有基线（升级路径不会执行时的兜底）
+    const regulationCount = await db.regulations.count();
+    if (regulationCount === 0) {
+      await db.regulations.bulkPut(buildSeedRegulations(Date.now()));
+    }
     await seedDemoData();
   }
   stampDbVersion();
@@ -555,9 +876,10 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.regulations, db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
     async () => {
       await Promise.all([
+        db.regulations.clear(),
         db.arrays.clear(),
         db.stations.clear(),
         db.instruments.clear(),
@@ -576,14 +898,15 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与几何页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [regulations, arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+    db.regulations.count(),
     db.arrays.count(),
     db.stations.count(),
     db.instruments.count(),
     db.calibrations.count(),
     db.replaces.count(),
   ]);
-  return { arrays, stations, instruments, calibrations, replaces };
+  return { regulations, arrays, stations, instruments, calibrations, replaces };
 }
 
 /** 写入结构版本号到 localStorage，便于几何页比对 */

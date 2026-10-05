@@ -1,15 +1,17 @@
 /**
- * Redux store：汇总台阵 / 仪器 / 标定三个 slice。
+ * Redux store：汇总规程（计量站）/ 台阵 / 仪器 / 标定（台网中心）四个 slice。
  * 跨页状态全部放在 slice 中，组件只读 selector 并 dispatch 异步动作落 IndexedDB。
  */
 import { configureStore } from '@reduxjs/toolkit';
 import { useDispatch, useSelector, type TypedUseSelectorHook } from 'react-redux';
+import regulationReducer from '@/stores/regulationSlice';
 import arrayReducer from '@/stores/arraySlice';
 import instrumentReducer from '@/stores/instrumentSlice';
 import calibrationReducer from '@/stores/calibrationSlice';
 
 export const store = configureStore({
   reducer: {
+    regulation: regulationReducer,
     array: arrayReducer,
     instrument: instrumentReducer,
     calibration: calibrationReducer,

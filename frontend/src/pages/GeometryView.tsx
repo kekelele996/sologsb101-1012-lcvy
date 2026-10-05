@@ -28,6 +28,7 @@ import { useAppSelector } from '@/stores/store';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
 import { selectInstruments } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
+import { selectRegulations } from '@/stores/regulationSlice';
 import {
   DB_NAME,
   DB_VERSION,
@@ -40,7 +41,6 @@ import {
 } from '@/utils/db';
 import {
   buildArraySummaries,
-  buildBackupPayload,
   countPayload,
   exportBackupJson,
   importBackup,
@@ -52,7 +52,14 @@ import {
 } from '@/utils/export';
 import { bearingDeg, round, stationDistances, toLocalPlane, planeViewBox } from '@/utils/geo';
 
-const EMPTY_COUNTS: CountMap = { arrays: 0, stations: 0, instruments: 0, calibrations: 0, replaces: 0 };
+const EMPTY_COUNTS: CountMap = {
+  regulations: 0,
+  arrays: 0,
+  stations: 0,
+  instruments: 0,
+  calibrations: 0,
+  replaces: 0,
+};
 
 export default function GeometryView() {
   const { message } = AntdApp.useApp();
@@ -62,6 +69,7 @@ export default function GeometryView() {
   const instruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const regulations = useAppSelector(selectRegulations);
 
   const [selectedArrayId, setSelectedArrayId] = useState<string | null>(null);
   const [counts, setCounts] = useState<CountMap>(EMPTY_COUNTS);
@@ -86,7 +94,7 @@ export default function GeometryView() {
   useEffect(() => {
     void refresh();
     // 数据变化后刷新统计
-  }, [arrays, stations, instruments, calibrations, replaces]);
+  }, [arrays, stations, instruments, calibrations, replaces, regulations]);
 
   const activeArrayId = selectedArrayId ?? arrays[0]?.id ?? null;
   const activeArray = arrays.find((row) => row.id === activeArrayId) ?? null;
@@ -101,6 +109,7 @@ export default function GeometryView() {
       app: 'gbseisarray',
       dbVersion: DB_VERSION,
       exportedAt: new Date().toISOString(),
+      regulations,
       arrays,
       stations,
       instruments,
@@ -108,7 +117,7 @@ export default function GeometryView() {
       replaces,
     };
     return buildArraySummaries(payload);
-  }, [arrays, calibrations, instruments, replaces, stations]);
+  }, [arrays, calibrations, instruments, regulations, replaces, stations]);
 
   const activeSummary = summaries.find((row) => row.arrayId === activeArrayId) ?? null;
 
@@ -279,8 +288,9 @@ export default function GeometryView() {
       {notice ? <Alert type="success" showIcon message={notice} closable onClose={() => setNotice('')} /> : null}
 
       <div className="gb-stats-row">
-        <StatBadge label="台阵" value={counts.arrays} suffix="个" tone="primary" />
-        <StatBadge label="台站" value={counts.stations} suffix="个" tone="info" />
+        <StatBadge label="规程版本" value={counts.regulations} suffix="版" tone="primary" />
+        <StatBadge label="台阵" value={counts.arrays} suffix="个" tone="info" />
+        <StatBadge label="台站" value={counts.stations} suffix="个" tone="default" />
         <StatBadge label="仪器" value={counts.instruments} suffix="台" tone="default" />
         <StatBadge label="标定记录" value={counts.calibrations} suffix="次" tone="success" />
         <StatBadge label="更换记录" value={counts.replaces} suffix="条" tone="warning" />

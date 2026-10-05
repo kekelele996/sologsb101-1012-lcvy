@@ -7,8 +7,10 @@ import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { Badge, Button, Layout, Menu, Space, Tag, Typography, message } from 'antd';
 import {
   AppstoreOutlined,
+  AuditOutlined,
   DashboardOutlined,
   ExperimentOutlined,
+  FileSearchOutlined,
   GlobalOutlined,
   SwapOutlined,
   ThunderboltOutlined,
@@ -30,12 +32,18 @@ import {
   selectReplaces,
   startCalibrationSubscription,
 } from '@/stores/calibrationSlice';
+import {
+  selectRegulations,
+  startRegulationSubscription,
+} from '@/stores/regulationSlice';
 import { DB_NAME, DB_VERSION, initDatabase } from '@/utils/db';
 
 const { Header, Sider, Content, Footer } = Layout;
 
 /** 按当前路径决定导航高亮项 */
 function buildSelectedKey(pathname: string, currentArrayId: string | null): string {
+  if (pathname.startsWith('/regulations')) return ROUTES.regulations;
+  if (pathname.startsWith('/reconciliation')) return ROUTES.reconciliation;
   if (pathname.startsWith('/calibrations')) return ROUTES.calibrations;
   if (pathname.startsWith('/replacements')) return ROUTES.replacements;
   if (pathname.startsWith('/geometry')) return ROUTES.geometry;
@@ -54,6 +62,7 @@ export default function App() {
   const instruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const regulations = useAppSelector(selectRegulations);
   const currentArrayId = useAppSelector(selectCurrentArrayId);
   const ready = useAppSelector((state) => state.array.ready);
 
@@ -64,6 +73,7 @@ export default function App() {
         await initDatabase();
         if (cancelled) return;
         // 打开数据库后启动各表实时订阅，数据自动回流到 Redux
+        startRegulationSubscription(dispatch);
         startArraySubscription(dispatch);
         startInstrumentSubscription(dispatch);
         startCalibrationSubscription(dispatch);
@@ -82,6 +92,8 @@ export default function App() {
   const currentArray = arrays.find((row) => row.id === currentArrayId) ?? null;
   const selectedKey = buildSelectedKey(location.pathname, currentArrayId);
   const unqualified = calibrations.filter((row) => row.responseVerdict === '不合格').length;
+  const pendingRejudge = calibrations.filter((row) => row.bindStatus === 'pendingRejudge').length;
+  const mismatchCount = calibrations.filter((row) => row.bindStatus === 'readonlyMismatch').length;
   const pendingReplaces = replaces.filter((row) => row.state !== '已复核').length;
 
   return (
@@ -109,20 +121,40 @@ export default function App() {
             style={{ background: 'transparent' }}
             onClick={({ key }) => navigate(key)}
             items={[
-              { key: ROUTES.arrays, icon: <AppstoreOutlined />, label: '台阵与台站台账' },
+              { type: 'divider' as const },
               {
-                key: currentArrayId ? ROUTES.stations(currentArrayId) : 'stations-disabled',
-                icon: <ExperimentOutlined />,
-                label: currentArray ? `台站仪器 · ${currentArray.name}` : '台站仪器（先选台阵）',
-                disabled: !currentArrayId,
+                key: 'metrology-group',
+                label: '计量站',
+                type: 'group' as const,
+                children: [
+                  { key: ROUTES.regulations, icon: <AuditOutlined />, label: '检定规程管理' },
+                  { key: ROUTES.reconciliation, icon: <FileSearchOutlined />, label: '规程对账' },
+                ],
               },
-              { key: ROUTES.calibrations, icon: <DashboardOutlined />, label: '标定记录台' },
-              { key: ROUTES.replacements, icon: <SwapOutlined />, label: '合格评定与更换' },
+              {
+                key: 'network-group',
+                label: '台网中心',
+                type: 'group' as const,
+                children: [
+                  { key: ROUTES.arrays, icon: <AppstoreOutlined />, label: '台阵与台站台账' },
+                  {
+                    key: currentArrayId ? ROUTES.stations(currentArrayId) : 'stations-disabled',
+                    icon: <ExperimentOutlined />,
+                    label: currentArray ? `台站仪器 · ${currentArray.name}` : '台站仪器（先选台阵）',
+                    disabled: !currentArrayId,
+                  },
+                  { key: ROUTES.calibrations, icon: <DashboardOutlined />, label: '标定记录台' },
+                  { key: ROUTES.replacements, icon: <SwapOutlined />, label: '合格评定与更换' },
+                ],
+              },
               { key: ROUTES.geometry, icon: <GlobalOutlined />, label: '台阵几何与备份' },
             ]}
           />
           <div style={{ padding: '12px 16px', color: 'rgba(232,241,251,0.62)', fontSize: 12 }}>
             <Space direction="vertical" size={2}>
+              <span>
+                <AuditOutlined /> 规程 {regulations.length} 版
+              </span>
               <span>
                 <AppstoreOutlined /> 台阵 {arrays.length} · 台站 {stations.length}
               </span>
@@ -131,6 +163,9 @@ export default function App() {
               </span>
               <span>
                 <ThunderboltOutlined /> 标定 {calibrations.length} · 不合格 {unqualified}
+              </span>
+              <span>
+                <FileSearchOutlined /> 待重判 {pendingRejudge} · 对账不符 {mismatchCount}
               </span>
               <span>
                 <SwapOutlined /> 更换未闭环 {pendingReplaces}
@@ -169,9 +204,17 @@ export default function App() {
               )}
             </Space>
             <Space>
+              <Badge count={regulations.length} showZero color="#6a51a3" title="规程版本数" />
               <Badge count={calibrations.length} showZero color="#3f7bbf" title="标定记录总数" />
               <Badge count={unqualified} showZero color="#c0392b" title="不合格标定" />
+              <Badge count={pendingRejudge} showZero color="#d68910" title="换版后待重判标定" />
+              <Badge count={mismatchCount} showZero color="#7f8c8d" title="对账不符只读记录" />
               <Badge count={pendingReplaces} showZero color="#d68910" title="未闭环更换" />
+              {pendingRejudge + mismatchCount > 0 ? (
+                <Button size="small" danger onClick={() => navigate(ROUTES.reconciliation)}>
+                  去对账
+                </Button>
+              ) : null}
               {currentArrayId ? (
                 <Button size="small" onClick={() => navigate(ROUTES.stations(currentArrayId))}>
                   台站仪器
