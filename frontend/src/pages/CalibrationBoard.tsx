@@ -43,16 +43,15 @@ import {
   selectCalibrations,
   updateCalibration,
 } from '@/stores/calibrationSlice';
+import { selectBatches, selectRegulations } from '@/stores/regulationSlice';
 import {
   RESPONSE_VERDICTS,
-  SELF_NOISE_LIMIT,
-  SENSITIVITY_RANGE,
   createEmptyCalibrationFilter,
-  judgeCalibration,
   sensitivityDelta,
   type Calibration,
   type ResponseVerdict,
 } from '@/types/calibration';
+import { findEffectiveRegulation, judgeByRegulation } from '@/types/regulation';
 import { INSTRUMENT_TYPES, type InstrumentType } from '@/types/instrument';
 import { round } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';
@@ -63,6 +62,7 @@ interface CalibrationFormValues {
   sensitivity: number;
   selfNoise: number;
   responseVerdict: ResponseVerdict;
+  batchId: string | null;
   operator: string;
   agency: string;
   remark: string;
@@ -90,6 +90,8 @@ export default function CalibrationBoard() {
   const instruments = useAppSelector(selectInstruments);
   const stations = useAppSelector(selectStations);
   const arrays = useAppSelector(selectArrays);
+  const regulations = useAppSelector(selectRegulations);
+  const batches = useAppSelector(selectBatches);
   const filter = useAppSelector(selectCalibrationFilter);
 
   const [modalOpen, setModalOpen] = useState(false);
@@ -218,13 +220,16 @@ export default function CalibrationBoard() {
     setEditingId(null);
     const firstInstrument = instruments[0];
     const type = (firstInstrument?.type ?? '宽频带') as InstrumentType;
-    const range = SENSITIVITY_RANGE[type];
+    const today = dayjs().format('YYYY-MM-DD');
+    const effective = findEffectiveRegulation(regulations, today);
+    const range = effective?.typeLimits[type]?.sensitivity ?? { min: 800, max: 3000 };
     form.setFieldsValue({
       instrumentId: firstInstrument?.id ?? '',
       date: dayjs(),
       sensitivity: round((range.min + range.max) / 2, 2),
       selfNoise: 1.5,
       responseVerdict: '合格',
+      batchId: null,
       operator: '陈立群',
       agency: '省地震局计量站',
       remark: '',
@@ -240,6 +245,7 @@ export default function CalibrationBoard() {
       sensitivity: row.sensitivity,
       selfNoise: row.selfNoise,
       responseVerdict: row.responseVerdict,
+      batchId: row.batchId,
       operator: row.operator,
       agency: row.agency,
       remark: row.remark,
@@ -257,6 +263,7 @@ export default function CalibrationBoard() {
         sensitivity: Number(values.sensitivity),
         selfNoise: Number(values.selfNoise),
         responseVerdict: values.responseVerdict,
+        batchId: values.batchId ?? null,
         operator: values.operator.trim(),
         agency: values.agency?.trim() ?? '',
         remark: values.remark?.trim() ?? '',
@@ -267,8 +274,11 @@ export default function CalibrationBoard() {
       } else {
         await dispatch(createCalibration(payload)).unwrap();
         const instrument = instruments.find((row) => row.id === payload.instrumentId);
-        const verdict = judgeCalibration(instrument?.type ?? '宽频带', payload.sensitivity, payload.selfNoise);
-        message.success(`标定记录已保存，自动初判为「${verdict}」`);
+        const effective = findEffectiveRegulation(regulations, payload.date);
+        const verdict = effective
+          ? judgeByRegulation(effective, (instrument?.type ?? '宽频带') as InstrumentType, payload.sensitivity, payload.selfNoise)
+          : '待判定';
+        message.success(`标定记录已保存，按 ${effective?.code ?? '无生效规程'} 自动初判为「${verdict}」`);
       }
       setModalOpen(false);
     } finally {
@@ -346,8 +356,8 @@ export default function CalibrationBoard() {
             标定记录台
           </Typography.Title>
           <p className="gb-hint">
-            录入灵敏度、自噪与脉冲响应结论，系统按类型灵敏度区间（宽频带 {SENSITIVITY_RANGE.宽频带.min} ~{' '}
-            {SENSITIVITY_RANGE.宽频带.max}）与自噪限值（{SELF_NOISE_LIMIT}）自动初判；可勾选批量改结论。
+            录入灵敏度、自噪与脉冲响应结论，系统按标定当天生效的检定规程自动初判；同趟出车的仪器落在同版规程。
+            可勾选批量改结论，规程换版后没出结论的先挂着按新版重判。
           </p>
         </div>
         <Space wrap>
@@ -472,21 +482,33 @@ export default function CalibrationBoard() {
               width: 100,
               align: 'right',
               render: (_: unknown, item: CalibrationRow) => (
-                <span className={item.row.selfNoise > SELF_NOISE_LIMIT ? 'gb-danger gb-mono' : 'gb-mono'}>
-                  {item.row.selfNoise}
-                </span>
+                <span className="gb-mono">{item.row.selfNoise}</span>
               ),
             },
             {
               title: '响应结论',
               width: 190,
               render: (_: unknown, item: CalibrationRow) => (
-                <QualifyTag
-                  verdict={item.row.responseVerdict}
-                  sensitivity={item.row.sensitivity}
-                  selfNoise={item.row.selfNoise}
-                  size="small"
-                />
+                <Space direction="vertical" size={2}>
+                  <QualifyTag
+                    verdict={item.row.responseVerdict}
+                    sensitivity={item.row.sensitivity}
+                    selfNoise={item.row.selfNoise}
+                    size="small"
+                  />
+                  {item.row.verdictState === '待重判' ? (
+                    <Tag color="orange" style={{ fontSize: 11 }}>待重判</Tag>
+                  ) : null}
+                </Space>
+              ),
+            },
+            {
+              title: '依据规程',
+              width: 140,
+              render: (_: unknown, item: CalibrationRow) => (
+                <span className="gb-mono" style={{ fontSize: 12 }}>
+                  {item.row.regulationCode || '—'}
+                </span>
               ),
             },
             {
@@ -614,7 +636,9 @@ export default function CalibrationBoard() {
               })}
               onChange={(value: string) => {
                 const instrument = instruments.find((row) => row.id === value);
-                const range = SENSITIVITY_RANGE[instrument?.type ?? '宽频带'];
+                const today = dayjs().format('YYYY-MM-DD');
+                const effective = findEffectiveRegulation(regulations, today);
+                const range = effective?.typeLimits[instrument?.type ?? '宽频带']?.sensitivity ?? { min: 800, max: 3000 };
                 form.setFieldValue('sensitivity', round((range.min + range.max) / 2, 2));
               }}
             />
@@ -626,8 +650,27 @@ export default function CalibrationBoard() {
               </Form.Item>
             </Col>
             <Col span={12}>
+              <Form.Item name="batchId" label="标定批次（同趟出车）">
+                <Select
+                  allowClear
+                  placeholder="选择批次，同趟出车落在同版"
+                  options={batches.map((batch) => ({
+                    label: `${batch.code}（${batch.date}）· ${batch.regulationCode}`,
+                    value: batch.id,
+                  }))}
+                />
+              </Form.Item>
+            </Col>
+          </Row>
+          <Row gutter={12}>
+            <Col span={12}>
               <Form.Item name="responseVerdict" label="脉冲响应结论" rules={[{ required: true }]}>
                 <Select options={RESPONSE_VERDICTS.map((verdict) => ({ label: verdict, value: verdict }))} />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item name="selfNoise" label="自噪" rules={[{ required: true }]}>
+                <InputNumber min={0} max={100} step={0.01} style={{ width: '100%' }} />
               </Form.Item>
             </Col>
           </Row>
@@ -638,17 +681,12 @@ export default function CalibrationBoard() {
               </Form.Item>
             </Col>
             <Col span={12}>
-              <Form.Item name="selfNoise" label={`自噪（限值 ${SELF_NOISE_LIMIT}）`} rules={[{ required: true }]}>
-                <InputNumber min={0} max={100} step={0.01} style={{ width: '100%' }} />
-              </Form.Item>
-            </Col>
-          </Row>
-          <Row gutter={12}>
-            <Col span={12}>
               <Form.Item name="operator" label="标定人" rules={[{ required: true, message: '请填写标定人' }]}>
                 <Input maxLength={20} placeholder="如：陈立群" />
               </Form.Item>
             </Col>
+          </Row>
+          <Row gutter={12}>
             <Col span={12}>
               <Form.Item name="agency" label="标定机构">
                 <Input maxLength={40} placeholder="如：省地震局计量站" />

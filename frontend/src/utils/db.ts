@@ -12,9 +12,11 @@ import type { Instrument } from '@/types/instrument';
 import { judgeCalibration } from '@/types/calibration';
 import type { Calibration } from '@/types/calibration';
 import type { Replace } from '@/types/replace';
+import type { CalibrationBatch, VerificationRegulation } from '@/types/regulation';
+import { DEFAULT_REGULATIONS, findEffectiveRegulation, judgeByRegulation } from '@/types/regulation';
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbseisarray';
@@ -36,6 +38,8 @@ export interface BackupPayload {
   instruments: Instrument[];
   calibrations: Calibration[];
   replaces: Replace[];
+  regulations: VerificationRegulation[];
+  calibrationBatches: CalibrationBatch[];
 }
 
 export class SeisArrayDatabase extends Dexie {
@@ -44,6 +48,8 @@ export class SeisArrayDatabase extends Dexie {
   instruments!: Table<Instrument, string>;
   calibrations!: Table<Calibration, string>;
   replaces!: Table<Replace, string>;
+  regulations!: Table<VerificationRegulation, string>;
+  calibrationBatches!: Table<CalibrationBatch, string>;
 
   constructor() {
     super(DB_NAME);
@@ -58,7 +64,7 @@ export class SeisArrayDatabase extends Dexie {
     });
 
     // v2：补齐筛选与统计需要的索引（孔径/布设日期、经纬度/基岩、类型/序列号、灵敏度/结论、原因）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
         stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
@@ -86,6 +92,41 @@ export class SeisArrayDatabase extends Dexie {
               Object.assign(row, factory());
             });
         }
+      });
+
+    // v3：检定规程与标定批次独立成表；标定记录补规程号、批次与判定状态
+    this.version(DB_VERSION)
+      .stores({
+        arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
+        stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
+        instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
+        calibrations:
+          'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, regulationId, regulationCode, batchId, verdictState, updatedAt',
+        replaces: 'id, instrumentId, state, date, newSerialNo, updatedAt',
+        regulations: 'id, code, status, effectiveFrom, effectiveTo, updatedAt',
+        calibrationBatches: 'id, code, date, regulationId, regulationCode, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        // 迁移：计量站维护检定规程（记规程号、生效起止与类型区间）
+        const regCount = await tx.table('regulations').count();
+        if (regCount === 0) {
+          const now = Date.now();
+          await tx.table('regulations').bulkPut(
+            DEFAULT_REGULATIONS.map((reg) => ({ ...reg, createdAt: now, updatedAt: now }))
+          );
+        }
+        const regulations = await tx.table('regulations').toArray();
+        // 迁移：旧标定记录没记规程号，按标定日期回填当时版本；对不上只读保留
+        await tx.table('calibrations').toCollection().modify((row: Record<string, unknown>) => {
+          if (row.regulationId) return;
+          const effective = findEffectiveRegulation(regulations, String(row.date ?? ''));
+          if (effective) {
+            row.regulationId = effective.id;
+            row.regulationCode = effective.code;
+          }
+          row.verdictState = row.responseVerdict === '待判定' ? '待重判' : '已判定';
+          row.batchId = null;
+        });
       });
   }
 }
@@ -124,6 +165,17 @@ interface SeedCalibration {
   selfNoise: number;
   operator: string;
   agency: string;
+  remark: string;
+  /** 所属批次号（同趟出车），null 表示未归批次 */
+  batchCode: string | null;
+  /** 初始结论：不传则按生效规程自动初判 */
+  responseVerdict?: Calibration['responseVerdict'];
+}
+
+interface SeedBatch {
+  code: string;
+  name: string;
+  date: string;
   remark: string;
 }
 
@@ -208,6 +260,7 @@ export async function seedDemoData(): Promise<void> {
                   operator: '陈立群',
                   agency: '省地震局计量站',
                   remark: '响应曲线平滑',
+                  batchCode: '2023 春巡',
                 },
                 {
                   id: 'cal_ltx01_bb_2',
@@ -218,6 +271,7 @@ export async function seedDemoData(): Promise<void> {
                   operator: '陈立群',
                   agency: '省地震局计量站',
                   remark: '灵敏度略降 2.2%，仍在限内',
+                  batchCode: '2024 春巡',
                 },
               ],
             },
@@ -240,6 +294,19 @@ export async function seedDemoData(): Promise<void> {
                   operator: '周渝',
                   agency: '省地震局计量站',
                   remark: '首次标定',
+                  batchCode: null,
+                },
+                {
+                  id: 'cal_ltx01_st_2',
+                  instrumentId: 'ins_ltx01_st',
+                  date: '2024-10-15',
+                  sensitivity: 420.5,
+                  selfNoise: 2.1,
+                  operator: '周渝',
+                  agency: '省地震局计量站',
+                  remark: '复标待判：规程换版后按新版重判',
+                  batchCode: null,
+                  responseVerdict: '待判定',
                 },
               ],
             },
@@ -274,6 +341,7 @@ export async function seedDemoData(): Promise<void> {
                   operator: '林之遥',
                   agency: '省地震局计量站',
                   remark: '响应一致性良好',
+                  batchCode: null,
                 },
               ],
             },
@@ -296,6 +364,7 @@ export async function seedDemoData(): Promise<void> {
                   operator: '周渝',
                   agency: '省地震局计量站',
                   remark: '自噪超标，判定不合格',
+                  batchCode: null,
                 },
               ],
             },
@@ -330,6 +399,7 @@ export async function seedDemoData(): Promise<void> {
                   operator: '林之遥',
                   agency: '省地震局计量站',
                   remark: '脉冲响应合格',
+                  batchCode: null,
                 },
               ],
             },
@@ -374,6 +444,7 @@ export async function seedDemoData(): Promise<void> {
                   operator: '陈立群',
                   agency: '国家测震台网计量中心',
                   remark: '响应合格',
+                  batchCode: null,
                 },
                 {
                   id: 'cal_hx01_bb_2',
@@ -384,6 +455,7 @@ export async function seedDemoData(): Promise<void> {
                   operator: '陈立群',
                   agency: '国家测震台网计量中心',
                   remark: '变化 0.97%，合格',
+                  batchCode: '2024 秋巡',
                 },
               ],
             },
@@ -406,6 +478,7 @@ export async function seedDemoData(): Promise<void> {
                   operator: '周渝',
                   agency: '国家测震台网计量中心',
                   remark: '强震通道合格',
+                  batchCode: '2024 秋巡',
                 },
               ],
             },
@@ -440,6 +513,7 @@ export async function seedDemoData(): Promise<void> {
                   operator: '林之遥',
                   agency: '国家测震台网计量中心',
                   remark: '自噪接近上限，判定不合格',
+                  batchCode: null,
                 },
               ],
             },
@@ -447,6 +521,12 @@ export async function seedDemoData(): Promise<void> {
         },
       ],
     },
+  ];
+
+  const batches: SeedBatch[] = [
+    { code: '2023 春巡', name: '2023 年春季巡回标定', date: '2023-04-20', remark: '龙门峡流动台阵春季巡检' },
+    { code: '2024 春巡', name: '2024 年春季巡回标定', date: '2024-04-12', remark: '龙门峡流动台阵春季巡检' },
+    { code: '2024 秋巡', name: '2024 年秋季巡回标定', date: '2024-09-30', remark: '海西宽频带台阵秋季巡检' },
   ];
 
   const replaces: Replace[] = [
@@ -490,12 +570,35 @@ export async function seedDemoData(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.regulations, db.calibrationBatches],
     async () => {
       const stamp = (offset: number): { createdAt: number; updatedAt: number } => ({
         createdAt: now + offset,
         updatedAt: now + offset,
       });
+
+      // 计量站维护检定规程：先于标定记录落库，供判定引用
+      const regulationRows: VerificationRegulation[] = DEFAULT_REGULATIONS.map((reg, index) => ({
+        ...reg,
+        ...stamp(index),
+      }));
+      await db.regulations.bulkPut(regulationRows);
+
+      // 标定批次：同趟出车共用同一规程版本
+      const batchRows: CalibrationBatch[] = batches.map((batch, index) => {
+        const effective = findEffectiveRegulation(regulationRows, batch.date);
+        return {
+          id: createId('bat'),
+          code: batch.code,
+          date: batch.date,
+          regulationId: effective?.id ?? '',
+          regulationCode: effective?.code ?? '',
+          remark: batch.remark,
+          ...stamp(500 + index),
+        };
+      });
+      await db.calibrationBatches.bulkPut(batchRows);
+      const batchByCode = new Map(batchRows.map((row) => [row.code, row]));
 
       const arrayRows: SeisArray[] = [];
       const stationRows: SeisStation[] = [];
@@ -515,14 +618,26 @@ export async function seedDemoData(): Promise<void> {
               ...stamp(200 + arrayIndex * 200 + stationIndex * 50 + instrumentIndex),
             });
             calibrations.forEach((calibrationSeed, calibrationIndex) => {
-              const verdict = judgeCalibration(
-                instrumentRest.type,
-                calibrationSeed.sensitivity,
-                calibrationSeed.selfNoise
-              );
+              // 按标定当天生效的规程定响应结论；同趟出车落在同版
+              const batch = calibrationSeed.batchCode
+                ? batchByCode.get(calibrationSeed.batchCode) ?? null
+                : null;
+              const effective = batch
+                ? regulationRows.find((reg) => reg.id === batch.regulationId) ?? null
+                : findEffectiveRegulation(regulationRows, calibrationSeed.date);
+              const verdict =
+                calibrationSeed.responseVerdict ??
+                (effective
+                  ? judgeByRegulation(effective, instrumentRest.type, calibrationSeed.sensitivity, calibrationSeed.selfNoise)
+                  : judgeCalibration(instrumentRest.type, calibrationSeed.sensitivity, calibrationSeed.selfNoise));
+              const isPending = verdict === '待判定';
               calibrationRows.push({
                 ...calibrationSeed,
                 responseVerdict: verdict,
+                regulationId: effective?.id ?? '',
+                regulationCode: effective?.code ?? '',
+                batchId: batch?.id ?? null,
+                verdictState: isPending ? '待重判' : '已判定',
                 ...stamp(
                   400 + arrayIndex * 400 + stationIndex * 100 + instrumentIndex * 20 + calibrationIndex
                 ),
@@ -555,7 +670,7 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.regulations, db.calibrationBatches],
     async () => {
       await Promise.all([
         db.arrays.clear(),
@@ -563,6 +678,8 @@ export async function clearAllTables(): Promise<void> {
         db.instruments.clear(),
         db.calibrations.clear(),
         db.replaces.clear(),
+        db.regulations.clear(),
+        db.calibrationBatches.clear(),
       ]);
     }
   );
@@ -576,14 +693,17 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与几何页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
-    db.arrays.count(),
-    db.stations.count(),
-    db.instruments.count(),
-    db.calibrations.count(),
-    db.replaces.count(),
-  ]);
-  return { arrays, stations, instruments, calibrations, replaces };
+  const [arrays, stations, instruments, calibrations, replaces, regulations, calibrationBatches] =
+    await Promise.all([
+      db.arrays.count(),
+      db.stations.count(),
+      db.instruments.count(),
+      db.calibrations.count(),
+      db.replaces.count(),
+      db.regulations.count(),
+      db.calibrationBatches.count(),
+    ]);
+  return { arrays, stations, instruments, calibrations, replaces, regulations, calibrationBatches };
 }
 
 /** 写入结构版本号到 localStorage，便于几何页比对 */

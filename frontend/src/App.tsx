@@ -12,6 +12,7 @@ import {
   GlobalOutlined,
   SwapOutlined,
   ThunderboltOutlined,
+  SafetyCertificateOutlined,
 } from '@ant-design/icons';
 import { ROUTES } from '@/router';
 import { useAppDispatch, useAppSelector } from '@/stores/store';
@@ -30,6 +31,7 @@ import {
   selectReplaces,
   startCalibrationSubscription,
 } from '@/stores/calibrationSlice';
+import { startRegulationSubscription } from '@/stores/regulationSlice';
 import { DB_NAME, DB_VERSION, initDatabase } from '@/utils/db';
 
 const { Header, Sider, Content, Footer } = Layout;
@@ -37,6 +39,7 @@ const { Header, Sider, Content, Footer } = Layout;
 /** 按当前路径决定导航高亮项 */
 function buildSelectedKey(pathname: string, currentArrayId: string | null): string {
   if (pathname.startsWith('/calibrations')) return ROUTES.calibrations;
+  if (pathname.startsWith('/regulations')) return ROUTES.regulations;
   if (pathname.startsWith('/replacements')) return ROUTES.replacements;
   if (pathname.startsWith('/geometry')) return ROUTES.geometry;
   if (pathname.startsWith('/stations/') && currentArrayId) return ROUTES.stations(currentArrayId);
@@ -67,6 +70,7 @@ export default function App() {
         startArraySubscription(dispatch);
         startInstrumentSubscription(dispatch);
         startCalibrationSubscription(dispatch);
+        startRegulationSubscription(dispatch);
       } catch (error) {
         if (cancelled) return;
         messageApi.error(
@@ -117,6 +121,7 @@ export default function App() {
                 disabled: !currentArrayId,
               },
               { key: ROUTES.calibrations, icon: <DashboardOutlined />, label: '标定记录台' },
+              { key: ROUTES.regulations, icon: <SafetyCertificateOutlined />, label: '检定规程与对账' },
               { key: ROUTES.replacements, icon: <SwapOutlined />, label: '合格评定与更换' },
               { key: ROUTES.geometry, icon: <GlobalOutlined />, label: '台阵几何与备份' },
             ]}

@@ -12,23 +12,35 @@ import {
   type BackupPayload,
 } from '@/utils/db';
 import type { ResponseVerdict } from '@/types/calibration';
+import type { CalibrationBatch, VerificationRegulation } from '@/types/regulation';
 import { apertureKm, centroid, haversineKm, round, stationDistances } from '@/utils/geo';
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['arrays', 'stations', 'instruments', 'calibrations', 'replaces'] as const;
+export const BACKUP_KEYS = [
+  'arrays',
+  'stations',
+  'instruments',
+  'calibrations',
+  'replaces',
+  'regulations',
+  'calibrationBatches',
+] as const;
 export type BackupKey = (typeof BACKUP_KEYS)[number];
 
 export type CountMap = Record<BackupKey, number>;
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
-    db.arrays.toArray(),
-    db.stations.toArray(),
-    db.instruments.toArray(),
-    db.calibrations.toArray(),
-    db.replaces.toArray(),
-  ]);
+  const [arrays, stations, instruments, calibrations, replaces, regulations, calibrationBatches] =
+    await Promise.all([
+      db.arrays.toArray(),
+      db.stations.toArray(),
+      db.instruments.toArray(),
+      db.calibrations.toArray(),
+      db.replaces.toArray(),
+      db.regulations.toArray(),
+      db.calibrationBatches.toArray(),
+    ]);
   return {
     app: 'gbseisarray',
     dbVersion: DB_VERSION,
@@ -38,6 +50,8 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     instruments,
     calibrations,
     replaces,
+    regulations,
+    calibrationBatches,
   };
 }
 
@@ -68,6 +82,8 @@ export function validateBackup(input: unknown): {
     instruments: obj.instruments ?? [],
     calibrations: obj.calibrations ?? [],
     replaces: obj.replaces ?? [],
+    regulations: obj.regulations ?? [],
+    calibrationBatches: obj.calibrationBatches ?? [],
   };
   return { ok: true, errors, payload };
 }
@@ -80,6 +96,8 @@ export function countPayload(payload: BackupPayload): CountMap {
     instruments: payload.instruments.length,
     calibrations: payload.calibrations.length,
     replaces: payload.replaces.length,
+    regulations: payload.regulations.length,
+    calibrationBatches: payload.calibrationBatches.length,
   };
 }
 
@@ -117,13 +135,15 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables();
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.regulations, db.calibrationBatches],
     async () => {
       await db.arrays.bulkPut(payload.arrays);
       await db.stations.bulkPut(payload.stations);
       await db.instruments.bulkPut(payload.instruments);
       await db.calibrations.bulkPut(payload.calibrations);
       await db.replaces.bulkPut(payload.replaces);
+      await db.regulations.bulkPut(payload.regulations);
+      await db.calibrationBatches.bulkPut(payload.calibrationBatches);
     }
   );
   return countPayload(payload);
@@ -134,6 +154,7 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const arrayMap = new Map<string, string>();
   const stationMap = new Map<string, string>();
   const instrumentMap = new Map<string, string>();
+  const batchMap = new Map<string, string>();
 
   const arrays = payload.arrays.map((row) => {
     const id = createId('arr');
@@ -150,17 +171,23 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     instrumentMap.set(row.id, id);
     return { ...row, id, stationId: stationMap.get(row.stationId) ?? row.stationId };
   });
+  const batches = payload.calibrationBatches.map((row) => {
+    const id = createId('bat');
+    batchMap.set(row.id, id);
+    return { ...row, id };
+  });
   const calibrations = payload.calibrations.map((row) => ({
     ...row,
     id: createId('cal'),
     instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
+    batchId: row.batchId ? batchMap.get(row.batchId) ?? row.batchId : null,
   }));
   const replaces = payload.replaces.map((row) => ({
     ...row,
     id: createId('rpl'),
     instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
   }));
-  return { ...payload, arrays, stations, instruments, calibrations, replaces };
+  return { ...payload, arrays, stations, instruments, calibrations, replaces, calibrationBatches: batches };
 }
 
 /** 按台阵汇总的几何与标定结论 */

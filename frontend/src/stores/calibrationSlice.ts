@@ -9,11 +9,12 @@ import type {
   CalibrationFilterState,
   ResponseVerdict,
 } from '@/types/calibration';
-import { createEmptyCalibrationFilter, judgeCalibration, sensitivityDelta } from '@/types/calibration';
+import { createEmptyCalibrationFilter, sensitivityDelta } from '@/types/calibration';
 import type { Replace, ReplaceFilterState, ReplaceState } from '@/types/replace';
 import { canTransition, createEmptyReplaceFilter } from '@/types/replace';
 import type { Instrument } from '@/types/instrument';
 import type { RootState } from '@/stores/store';
+import { findEffectiveRegulation, judgeWithState } from '@/types/regulation';
 
 /** 选择器入参统一用 RootState */
 type WithCalibration = RootState;
@@ -43,10 +44,19 @@ const initialState: CalibrationSliceState = {
 
 export const createCalibration = createAsyncThunk(
   'calibration/createCalibration',
-  async (payload: Omit<Calibration, 'id' | 'createdAt' | 'updatedAt' | 'responseVerdict'>) => {
+  async (
+    payload: Omit<Calibration, 'id' | 'createdAt' | 'updatedAt' | 'responseVerdict' | 'regulationId' | 'regulationCode' | 'verdictState'>
+  ) => {
     const now = Date.now();
     const instrument = await db.instruments.get(payload.instrumentId);
-    const verdict = judgeCalibration(
+    // 按标定当天生效的规程定响应结论；同趟出车落在同版
+    const regulations = await db.regulations.toArray();
+    const batch = payload.batchId ? await db.calibrationBatches.get(payload.batchId) : undefined;
+    const effective = batch
+      ? regulations.find((reg) => reg.id === batch.regulationId) ?? null
+      : findEffectiveRegulation(regulations, payload.date);
+    const { verdict, verdictState } = judgeWithState(
+      effective,
       instrument?.type ?? '宽频带',
       payload.sensitivity,
       payload.selfNoise
@@ -54,6 +64,9 @@ export const createCalibration = createAsyncThunk(
     const row: Calibration = {
       ...payload,
       responseVerdict: verdict,
+      regulationId: effective?.id ?? '',
+      regulationCode: effective?.code ?? '',
+      verdictState,
       id: createId('cal'),
       createdAt: now,
       updatedAt: now,
@@ -77,10 +90,27 @@ export const updateCalibration = createAsyncThunk(
     const instrument = existing ? await db.instruments.get(existing.instrumentId) : undefined;
     const nextSensitivity = payload.patch.sensitivity ?? existing?.sensitivity ?? 0;
     const nextNoise = payload.patch.selfNoise ?? existing?.selfNoise ?? 0;
-    const verdict = judgeCalibration(instrument?.type ?? '宽频带', nextSensitivity, nextNoise);
+    const nextDate = payload.patch.date ?? existing?.date ?? '';
+    // 按标定当天生效的规程重新核定结论与依据
+    const regulations = await db.regulations.toArray();
+    const batchId = payload.patch.batchId ?? existing?.batchId ?? null;
+    const batch = batchId ? await db.calibrationBatches.get(batchId) : undefined;
+    const effective = batch
+      ? regulations.find((reg) => reg.id === batch.regulationId) ?? null
+      : findEffectiveRegulation(regulations, nextDate);
+    const { verdict, verdictState } = judgeWithState(
+      effective,
+      instrument?.type ?? '宽频带',
+      nextSensitivity,
+      nextNoise
+    );
     await db.calibrations.update(payload.id, {
       ...payload.patch,
       responseVerdict: payload.patch.responseVerdict ?? verdict,
+      regulationId: effective?.id ?? existing?.regulationId ?? '',
+      regulationCode: effective?.code ?? existing?.regulationCode ?? '',
+      batchId,
+      verdictState: payload.patch.responseVerdict ? '已判定' : verdictState,
       updatedAt: Date.now(),
     } as never);
     return payload;
@@ -105,6 +135,7 @@ export const bulkSetVerdict = createAsyncThunk(
       .anyOf(payload.ids)
       .modify((row) => {
         row.responseVerdict = payload.verdict;
+        row.verdictState = payload.verdict === '待判定' ? '待重判' : '已判定';
         row.updatedAt = now;
       });
     return payload;

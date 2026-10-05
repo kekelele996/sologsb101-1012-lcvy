@@ -52,7 +52,15 @@ import {
 } from '@/utils/export';
 import { bearingDeg, round, stationDistances, toLocalPlane, planeViewBox } from '@/utils/geo';
 
-const EMPTY_COUNTS: CountMap = { arrays: 0, stations: 0, instruments: 0, calibrations: 0, replaces: 0 };
+const EMPTY_COUNTS: CountMap = {
+  arrays: 0,
+  stations: 0,
+  instruments: 0,
+  calibrations: 0,
+  replaces: 0,
+  regulations: 0,
+  calibrationBatches: 0,
+};
 
 export default function GeometryView() {
   const { message } = AntdApp.useApp();
@@ -106,6 +114,8 @@ export default function GeometryView() {
       instruments,
       calibrations,
       replaces,
+      regulations: [],
+      calibrationBatches: [],
     };
     return buildArraySummaries(payload);
   }, [arrays, calibrations, instruments, replaces, stations]);
@@ -215,7 +225,7 @@ export default function GeometryView() {
 
   const handleReset = async (): Promise<void> => {
     const confirmed = window.confirm(
-      '将清空全部本地数据并重新播种演示数据（台阵、台站、仪器、标定、更换）。确认继续？'
+      '将清空全部本地数据并重新播种演示数据（台阵、台站、仪器、标定、更换、检定规程、批次）。确认继续？'
     );
     if (!confirmed) return;
     setBusy(true);
@@ -284,6 +294,8 @@ export default function GeometryView() {
         <StatBadge label="仪器" value={counts.instruments} suffix="台" tone="default" />
         <StatBadge label="标定记录" value={counts.calibrations} suffix="次" tone="success" />
         <StatBadge label="更换记录" value={counts.replaces} suffix="条" tone="warning" />
+        <StatBadge label="检定规程" value={counts.regulations} suffix="版" tone="info" />
+        <StatBadge label="标定批次" value={counts.calibrationBatches} suffix="批" tone="default" />
       </div>
 
       {!activeArray || !activeSummary ? (
@@ -505,13 +517,14 @@ export default function GeometryView() {
             <Descriptions.Item label="台阵 / 台站">{counts.arrays} / {counts.stations}</Descriptions.Item>
             <Descriptions.Item label="仪器 / 标定">{counts.instruments} / {counts.calibrations}</Descriptions.Item>
             <Descriptions.Item label="更换记录">{counts.replaces}</Descriptions.Item>
+            <Descriptions.Item label="检定规程 / 批次">{counts.regulations} / {counts.calibrationBatches}</Descriptions.Item>
             <Descriptions.Item label="最近备份时间" span={3}>
               {lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份'}
             </Descriptions.Item>
           </Descriptions>
           <p className="gb-hint">
             数据仅保存在当前浏览器 IndexedDB（{DB_NAME}）中，换浏览器或清空站点数据后不会自动跟随，请通过 JSON
-            备份迁移。导出内容包含 arrays / stations / instruments / calibrations / replaces 五张表。
+            备份迁移。导出内容包含 arrays / stations / instruments / calibrations / replaces / regulations / calibrationBatches 七张表。
           </p>
         </Space>
       </Card>

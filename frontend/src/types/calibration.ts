@@ -16,6 +16,14 @@ export interface Calibration {
   selfNoise: number;
   /** 脉冲响应结论 */
   responseVerdict: ResponseVerdict;
+  /** 依据的检定规程 id（计量站维护的版本） */
+  regulationId: string;
+  /** 依据的规程号（冗余，便于对账与展示） */
+  regulationCode: string;
+  /** 所属标定批次 id（同趟出车共用同一规程版本），null 表示未归批次 */
+  batchId: string | null;
+  /** 判定状态：已判定（出过结论）/ 待重判（没出结论，先挂着按新版重判） */
+  verdictState: '已判定' | '待重判';
   /** 标定人 */
   operator: string;
   /** 标定机构 */
